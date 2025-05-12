@@ -25,6 +25,13 @@ class Method:
     parent_class: Optional[str] = None
     return_type: Optional[str] = None
     parameters: List[Variable] = None
+    local_variables: List[Variable] = None
+
+    def __post_init__(self):
+        if self.parameters is None:
+            self.parameters = []
+        if self.local_variables is None:
+            self.local_variables = []
 
 @dataclass
 class Class:
@@ -227,7 +234,7 @@ class CppParser:
             # 处理函数/方法定义
             method_name = None
             return_type = None
-            
+            method_obj = None
             # 查找方法名
             for child in node.children:
                 if child.type == 'function_declarator':
@@ -237,7 +244,6 @@ class CppParser:
                             break
                 elif child.type in ['primitive_type', 'type_identifier', 'qualified_identifier']:
                     return_type = content[child.start_byte:child.end_byte].decode('utf-8', errors='ignore')
-            
             if method_name:
                 # 创建方法对象
                 if current_class:
@@ -249,17 +255,22 @@ class CppParser:
                         return_type=return_type
                     )
                     current_class.methods.append(method)
+                    method_obj = method
                 else:
                     # 全局方法
                     ns_prefix = '::'.join(self.namespace_stack) if self.namespace_stack else ""
                     full_name = f"{ns_prefix}::{method_name}" if ns_prefix else method_name
-                    
                     method = Method(
                         name=full_name,
                         location=(file_path, node.start_point[0] + 1, node.start_point[1] + 1),
                         return_type=return_type
                     )
                     self.global_methods.append(method)
+                    method_obj = method
+            # 递归遍历函数体，收集局部变量
+            for child in node.children:
+                if child.type == 'compound_statement' and method_obj is not None:
+                    self._collect_local_variables(child, content, file_path, method_obj)
         
         elif node.type == 'field_declaration':
             # 处理类成员变量
@@ -455,41 +466,52 @@ class CppParser:
             
             # 写入变量表格
             f.write('\n## 变量\n\n')
-            f.write('| 类 | 变量名 | 变量类型 | 变量位置 |\n')
-            f.write('|---|---|---|---|\n')
+            f.write('| 作用域 | 类/方法 | 变量名 | 变量类型 | 变量位置 |\n')
+            f.write('|---|---|---|---|---|\n')
             
             # 类变量
             for class_path, class_obj in sorted(self.classes.items()):
                 for var in sorted(class_obj.variables, key=lambda v: v.name):
                     file_path, line, col = var.location
                     rel_path = os.path.relpath(file_path, self.cpp_dir)
-                    
-                    # 处理变量类型
                     var_type = var.full_type_path
-                    
-                    # 避免重复
                     var_key = f"{class_obj.full_path}::{var.name}::{rel_path}:{line}:{col}"
                     if var_key in processed_variables:
                         continue
                     processed_variables.add(var_key)
-                    
-                    f.write(f'| {class_obj.full_path} | {var.name} | {var_type} | {rel_path}:{line}:{col} |\n')
-            
+                    f.write(f'| 类成员 | {class_obj.full_path} | {var.name} | {var_type} | {rel_path}:{line}:{col} |\n')
             # 全局变量
             for var in sorted(self.global_variables, key=lambda v: v.name):
                 file_path, line, col = var.location
                 rel_path = os.path.relpath(file_path, self.cpp_dir)
-                
-                # 处理变量类型
                 var_type = var.full_type_path
-                
-                # 避免重复
                 var_key = f"global::{var.name}::{rel_path}:{line}:{col}"
                 if var_key in processed_variables:
                     continue
                 processed_variables.add(var_key)
-                
-                f.write(f'| 全局 | {var.name} | {var_type} | {rel_path}:{line}:{col} |\n')
+                f.write(f'| 全局 | - | {var.name} | {var_type} | {rel_path}:{line}:{col} |\n')
+            # 方法局部变量
+            for class_path, class_obj in sorted(self.classes.items()):
+                for method in class_obj.methods:
+                    for var in sorted(method.local_variables, key=lambda v: v.name):
+                        file_path, line, col = var.location
+                        rel_path = os.path.relpath(file_path, self.cpp_dir)
+                        var_type = var.full_type_path
+                        var_key = f"local::{class_obj.full_path}::{method.name}::{var.name}::{rel_path}:{line}:{col}"
+                        if var_key in processed_variables:
+                            continue
+                        processed_variables.add(var_key)
+                        f.write(f'| 局部 | {class_obj.full_path}::{method.name} | {var.name} | {var_type} | {rel_path}:{line}:{col} |\n')
+            for method in self.global_methods:
+                for var in sorted(method.local_variables, key=lambda v: v.name):
+                    file_path, line, col = var.location
+                    rel_path = os.path.relpath(file_path, self.cpp_dir)
+                    var_type = var.full_type_path
+                    var_key = f"local::global::{method.name}::{var.name}::{rel_path}:{line}:{col}"
+                    if var_key in processed_variables:
+                        continue
+                    processed_variables.add(var_key)
+                    f.write(f'| 局部 | {method.name} | {var.name} | {var_type} | {rel_path}:{line}:{col} |\n')
 
     def _debug_print_state(self):
         """打印当前解析器状态的调试信息"""
@@ -583,6 +605,35 @@ class CppParser:
         # 更新类映射
         if new_classes:
             self.classes = new_classes
+
+    def _collect_local_variables(self, node, content: bytes, file_path: str, method_obj: Method):
+        """递归收集函数体内的局部变量声明"""
+        if node.type == 'declaration':
+            type_name = None
+            for child in node.children:
+                if child.type in ['primitive_type', 'type_identifier', 'qualified_identifier']:
+                    type_name = content[child.start_byte:child.end_byte].decode('utf-8', errors='ignore')
+                    break
+            if type_name:
+                full_type = type_name
+                if type_name in self.type_map:
+                    full_type = self.type_map[type_name]
+                for child in node.children:
+                    if child.type == 'init_declarator':
+                        for decl_child in child.children:
+                            if decl_child.type == 'identifier':
+                                var_name = content[decl_child.start_byte:decl_child.end_byte].decode('utf-8', errors='ignore')
+                                var = Variable(
+                                    name=var_name,
+                                    type=type_name,
+                                    full_type_path=full_type,
+                                    location=(file_path, decl_child.start_point[0] + 1, decl_child.start_point[1] + 1),
+                                    parent_class=method_obj.name
+                                )
+                                method_obj.local_variables.append(var)
+        # 递归遍历子节点
+        for child in node.children:
+            self._collect_local_variables(child, content, file_path, method_obj)
 
 def main():
     if len(sys.argv) < 2:
